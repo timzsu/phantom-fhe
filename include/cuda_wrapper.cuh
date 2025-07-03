@@ -28,7 +28,7 @@ inline void check(T err, const char *const func, const char *const file,
                   << std::endl;
         std::cerr << cudaGetErrorString(err) << " " << func
                   << std::endl;
-//        std::exit(EXIT_FAILURE);
+        std::exit(EXIT_FAILURE);
     }
 }
 
@@ -47,6 +47,7 @@ namespace phantom::util {
     class cuda_stream_wrapper {
     public:
         cuda_stream_wrapper() {
+            cudaSetDevice(0); // TODO: remove me
             cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
         }
 

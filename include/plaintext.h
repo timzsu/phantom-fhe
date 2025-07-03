@@ -55,6 +55,10 @@ public:
         return parms_id_;
     }
 
+    [[nodiscard]] auto &parms_id() noexcept {
+        return parms_id_;
+    }
+
     [[nodiscard]] auto &chain_index() const noexcept {
         return chain_index_;
     }
@@ -63,8 +67,16 @@ public:
         return scale_;
     }
 
+    [[nodiscard]] auto &scale() noexcept {
+        return scale_;
+    }
+
     [[nodiscard]] auto data() const noexcept {
         return data_.get();
+    }
+    
+    [[nodiscard]] auto data(size_t coeff_index) noexcept {
+        return data_.get() + coeff_index;
     }
 
     [[nodiscard]] auto &data_ptr() noexcept {

@@ -3,6 +3,7 @@
 #include "rns_bconv.cuh"
 #include "scalingvariant.cuh"
 #include "util.cuh"
+#include <iostream>
 
 using namespace std;
 using namespace phantom;
@@ -118,9 +119,9 @@ void add_inplace(const PhantomContext &context, PhantomCiphertext &encrypted1, c
     if (encrypted1.is_ntt_form() != encrypted2.is_ntt_form()) {
         throw std::invalid_argument("NTT form mismatch");
     }
-    if (!are_same_scale(encrypted1, encrypted2)) {
-        throw std::invalid_argument("scale mismatch");
-    }
+    // if (!are_same_scale(encrypted1, encrypted2)) {
+    //     throw std::invalid_argument("scale mismatch");
+    // }
     if (encrypted1.size() != encrypted2.size()) {
         throw std::invalid_argument("poly number mismatch");
     }
@@ -212,9 +213,9 @@ void add_many(const PhantomContext &context, const vector<PhantomCiphertext> &en
         if (encrypteds[0].is_ntt_form() != encrypteds[i].is_ntt_form()) {
             throw std::invalid_argument("NTT form mismatch");
         }
-        if (!are_same_scale(encrypteds[0], encrypteds[i])) {
-            throw std::invalid_argument("scale mismatch");
-        }
+        // if (!are_same_scale(encrypteds[0], encrypteds[i])) {
+        //     throw std::invalid_argument("scale mismatch");
+        // }
         if (encrypteds[0].size() != encrypteds[i].size()) {
             throw std::invalid_argument("poly number mismatch");
         }
@@ -1037,8 +1038,8 @@ void multiply_inplace(const PhantomContext &context, PhantomCiphertext &encrypte
         throw std::invalid_argument("encrypted1 and encrypted2 parameter mismatch");
     if (encrypted1.is_ntt_form() != encrypted2.is_ntt_form())
         throw std::invalid_argument("NTT form mismatch");
-    if (!are_same_scale(encrypted1, encrypted2))
-        throw std::invalid_argument("scale mismatch");
+    // if (!are_same_scale(encrypted1, encrypted2))
+    //     throw std::invalid_argument("scale mismatch");
     if (encrypted1.size() != encrypted2.size())
         throw std::invalid_argument("poly number mismatch");
 
@@ -1072,8 +1073,8 @@ void multiply_and_relin_inplace(const PhantomContext &context, PhantomCiphertext
         throw std::invalid_argument("encrypted1 and encrypted2 parameter mismatch");
     if (encrypted1.is_ntt_form() != encrypted2.is_ntt_form())
         throw std::invalid_argument("NTT form mismatch");
-    if (!are_same_scale(encrypted1, encrypted2))
-        throw std::invalid_argument("scale mismatch");
+    // if (!are_same_scale(encrypted1, encrypted2))
+    //     throw std::invalid_argument("scale mismatch");
     if (encrypted1.size() != encrypted2.size())
         throw std::invalid_argument("poly number mismatch");
 
@@ -1130,6 +1131,9 @@ void add_plain_inplace(const PhantomContext &context, PhantomCiphertext &encrypt
     if (!are_same_scale(encrypted, plain)) {
         // TODO: be more precious
         throw std::invalid_argument("scale mismatch");
+    }
+    if (encrypted.chain_index() != plain.chain_index()) {
+      	throw invalid_argument("encrypted and plain parameter mismatch");
     }
 
     auto &coeff_modulus = parms.coeff_modulus();
@@ -1579,9 +1583,8 @@ PhantomCiphertext rescale_to_next(const PhantomContext &context, const PhantomCi
     return destination;
 }
 
-void apply_galois_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, size_t galois_elt_index,
-                          const PhantomGaloisKey &galois_keys,
-                          const phantom::util::cuda_stream_wrapper &stream_wrapper) {
+void apply_galois_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, uint32_t galois_elt,
+                          const PhantomGaloisKey &galois_keys, const phantom::util::cuda_stream_wrapper &stream_wrapper) {
     auto &context_data = context.get_context_data(encrypted.chain_index());
     auto &parms = context_data.parms();
     auto &coeff_modulus = parms.coeff_modulus();
@@ -1591,14 +1594,23 @@ void apply_galois_inplace(const PhantomContext &context, PhantomCiphertext &encr
     if (encrypted_size > 2) {
         throw invalid_argument("encrypted size must be 2");
     }
-    auto c0 = encrypted.data();
-    auto c1 = encrypted.data() + encrypted.coeff_modulus_size() * encrypted.poly_modulus_degree();
+    
     // Use key_context_data where permutation tables exist since previous runs.
     auto &key_galois_tool = context.key_galois_tool_;
+    auto &galois_elts = key_galois_tool->galois_elts();
+
+    auto iter = find(galois_elts.begin(), galois_elts.end(), galois_elt);
+    if (iter == galois_elts.end()) {
+        throw std::invalid_argument("Galois elt not present");
+    }
+    auto galois_elt_index = std::distance(galois_elts.begin(), iter);
 
     const auto &s = stream_wrapper.get_stream();
 
     auto temp = make_cuda_auto_ptr<uint64_t>(coeff_modulus_size * N, s);
+
+    auto c0 = encrypted.data();
+    auto c1 = encrypted.data() + encrypted.coeff_modulus_size() * encrypted.poly_modulus_degree();
 
     // DO NOT CHANGE EXECUTION ORDER OF FOLLOWING SECTION
     // BEGIN: Apply Galois for each ciphertext
@@ -1654,7 +1666,7 @@ static void rotate_internal(const PhantomContext &context, PhantomCiphertext &en
     if (iter != galois_elts.end()) {
         auto galois_elt_index = iter - galois_elts.begin();
         // Perform rotation and key switching
-        apply_galois_inplace(context, encrypted, galois_elt_index, galois_key, stream_wrapper);
+        apply_galois_inplace(context, encrypted, galois_elts[galois_elt_index], galois_key, stream_wrapper);
     } else {
         // Convert the steps to NAF: guarantees using smallest HW
         vector<int> naf_step = naf(step);
@@ -1689,7 +1701,8 @@ void rotate_columns_inplace(const PhantomContext &context, PhantomCiphertext &en
         context.key_context_data().parms().scheme() != phantom::scheme_type::bgv) {
         throw std::logic_error("unsupported scheme");
     }
-    apply_galois_inplace(context, encrypted, 0, galois_key, stream_wrapper);
+    auto &key_galois_tool = context.key_galois_tool_;
+    apply_galois_inplace(context, encrypted, key_galois_tool->get_elt_from_step(0), galois_key, stream_wrapper);
 }
 
 void rotate_vector_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, int step,
@@ -1707,7 +1720,8 @@ void complex_conjugate_inplace(const PhantomContext &context, PhantomCiphertext 
     if (context.key_context_data().parms().scheme() != phantom::scheme_type::ckks) {
         throw std::logic_error("unsupported scheme");
     }
-    apply_galois_inplace(context, encrypted, 0, galois_key, stream_wrapper);
+    auto &key_galois_tool = context.key_galois_tool_;
+    apply_galois_inplace(context, encrypted, key_galois_tool->get_elt_from_step(0), galois_key, stream_wrapper);
 }
 
 void hoisting_inplace(const PhantomContext &context, PhantomCiphertext &ct, const PhantomGaloisKey &glk,

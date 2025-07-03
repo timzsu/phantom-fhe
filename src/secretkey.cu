@@ -3,6 +3,10 @@
 #include "scalingvariant.cuh"
 #include "secretkey.h"
 
+#include <vector>
+#include <algorithm>
+#include <random>
+
 using namespace std;
 using namespace phantom;
 using namespace phantom::util;
@@ -338,6 +342,53 @@ void PhantomSecretKey::generate_one_kswitch_key(const PhantomContext &context, u
             alpha, bigP_mod_q, bigP_mod_q_shoup);
 }
 
+// Newly added
+std::vector<size_t> adjust_sk_hamming_weight(uint64_t *arr, size_t arr_size, size_t hamming_weight, uint64_t coeff_modulus) {
+    // Count the number of non-zero values in the array
+    size_t non_zero_count = std::count_if(arr, arr + arr_size, [](uint64_t x) { return x != 0; });
+
+    // If the current number of non-zero values is already equal to the desired hamming_weight, do nothing
+    if (non_zero_count == hamming_weight) {
+        throw std::invalid_argument("The hamming weight of the secret key is already equal to the desired hamming weight.");
+    }
+
+    // Random device and generator for shuffling and random index generation
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    // Reduce the number of non-zero values
+    if (non_zero_count > hamming_weight) {
+        // Indices of non-zero elements
+        std::vector<size_t> non_zero_indices;
+        for (size_t i = 0; i < arr_size; ++i) {
+            if (arr[i] != 0) {
+                non_zero_indices.push_back(i);
+            }
+        }
+
+        // Shuffle the indices to randomly select which non-zero elements to zero out
+        std::shuffle(non_zero_indices.begin(), non_zero_indices.end(), gen);
+
+        // Zero out the necessary number of non-zero elements to match the desired hamming_weight
+        size_t elements_to_zero = non_zero_count - hamming_weight;
+        for (size_t i = 0; i < elements_to_zero; ++i) {
+            arr[non_zero_indices[i]] = 0;
+        }
+
+        return non_zero_indices;
+    }
+    
+    throw std::invalid_argument("Increasing the hamming weight of the secret key is not supported.");
+}
+
+// Newly added
+void adjust_sk_hamming_weight(uint64_t *arr, size_t hamming_weight, std::vector<size_t> non_zero_indices) {
+    size_t elements_to_zero = non_zero_indices.size() - hamming_weight;
+    for (size_t i = 0; i < elements_to_zero; ++i) {
+        arr[non_zero_indices[i]] = 0;
+    }
+}
+
 void PhantomSecretKey::gen_secretkey(const PhantomContext &context, const cudaStream_t &stream) {
     if (gen_flag_) {
         throw std::logic_error("cannot generate secret key twice");
@@ -368,6 +419,31 @@ void PhantomSecretKey::gen_secretkey(const PhantomContext &context, const cudaSt
     sample_ternary_poly<<<gridDimGlb, blockDimGlb, 0, s>>>(
             secret_key_array_.get(), prng_seed_error.get(), base_rns,
             poly_degree, coeff_mod_size);
+
+    // Newly added: adjust the hamming weight of the secret key if necessary
+    if (auto sk_hamming_weight = context.key_context_data().parms().secret_key_hamming_weight()) {
+			std::cout << "Generating secret key with hamming weight: " << sk_hamming_weight << std::endl;
+
+	  	// Make sure device has finished previous kernels
+      cudaStreamSynchronize(s);
+
+      // Copy sk data from device to host
+      uint64_t *sk_arr_non_ntt = new uint64_t[poly_degree * coeff_mod_size];
+      cudaMemcpy(sk_arr_non_ntt, secret_key_array_.get(), poly_degree * coeff_mod_size * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+      // Adjust hamming weight for each rns sk (each sk should be the same but with different modulus)
+      
+			// Get the indices of non-zero elements in the secret keys
+      std::vector<size_t> non_zero_indices = adjust_sk_hamming_weight(sk_arr_non_ntt, poly_degree, sk_hamming_weight, coeff_modulus[0].value());
+      
+			// Adjust the hamming weight for the rest of the secret keys (set the randomly chosen non-zero indices from last step to zero)
+      for (auto i = 1; i < coeff_mod_size; i++) {
+        adjust_sk_hamming_weight(sk_arr_non_ntt + i * poly_degree, sk_hamming_weight, non_zero_indices);
+      }
+
+      // Copy the adjusted secret key back to the device
+      cudaMemcpy(secret_key_array_.get(), sk_arr_non_ntt, poly_degree * coeff_mod_size * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    }
 
     // Compute the NTT form of secret key and
     // save secret_key to the first coeff_mod_size * N elements of secret_key_array
@@ -458,6 +534,31 @@ PhantomGaloisKey PhantomSecretKey::create_galois_keys(const PhantomContext &cont
     return galois_keys;
 }
 
+PhantomGaloisKey PhantomSecretKey::create_galois_keys_from_elts(PhantomContext &context, const std::vector<uint32_t> &elts) const {
+    const auto &s = phantom::util::global_variables::default_stream->get_stream();
+
+    int log_n = phantom::arith::get_power_of_two(context.poly_degree_);
+    bool is_bfv = (context.first_context_data().parms().scheme() == phantom::scheme_type::bfv);
+    
+    context.key_galois_tool_.reset();
+    context.key_galois_tool_ = std::make_unique<PhantomGaloisTool>(elts, log_n, s, is_bfv);
+
+    return create_galois_keys(context);
+}
+
+PhantomGaloisKey PhantomSecretKey::create_galois_keys_from_steps(PhantomContext &context, const std::vector<int> &steps) const {
+    const auto &s = phantom::util::global_variables::default_stream->get_stream();
+    
+    auto elts = context.key_galois_tool_->get_elts_from_steps(steps);
+    int log_n = phantom::arith::get_power_of_two(context.poly_degree_);
+    bool is_bfv = (context.first_context_data().parms().scheme() == phantom::scheme_type::bfv);
+    
+    context.key_galois_tool_.reset();
+    context.key_galois_tool_ = std::make_unique<PhantomGaloisTool>(elts, log_n, s, is_bfv);
+
+    return create_galois_keys(context);
+}
+
 void PhantomSecretKey::encrypt_symmetric(const PhantomContext &context, const PhantomPlaintext &plain,
                                          PhantomCiphertext &cipher,
                                          const phantom::util::cuda_stream_wrapper &stream_wrapper) const {
@@ -546,9 +647,9 @@ void PhantomSecretKey::ckks_decrypt(const PhantomContext &context, const Phantom
     }
 
     uint64_t *c0 = encrypted.data();
-
     cudaMemcpyAsync(destination.data(), c0, coeff_mod_size * poly_degree * sizeof(uint64_t),
                     cudaMemcpyDeviceToDevice, stream);
+
     uint64_t gridDimGlb = poly_degree * coeff_mod_size / blockDimGlb.x;
     for (size_t i = 1; i <= needed_sk_power; i++) {
         uint64_t *ci = encrypted.data() + i * coeff_mod_size * poly_degree;
@@ -802,7 +903,7 @@ int PhantomSecretKey::invariant_noise_budget(const PhantomContext &context,
     std::vector<uint64_t> host_noise_poly(coeff_mod_size * poly_degree);
     cudaMemcpyAsync(host_noise_poly.data(), c0, coeff_mod_size * poly_degree * sizeof(uint64_t), cudaMemcpyDeviceToHost,
                     s);
-
+    
     // explicit stream synchronize to avoid error
     cudaStreamSynchronize(s);
 
