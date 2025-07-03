@@ -147,6 +147,10 @@ namespace phantom::util {
             return this->ptr_;
         }
 
+        void set(T* guest_ptr) {
+            ptr_  = guest_ptr;
+        }
+
         T *operator->() const {
             return this->ptr_;
         }

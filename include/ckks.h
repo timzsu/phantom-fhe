@@ -1,6 +1,7 @@
 #pragma once
 
 #include "context.cuh"
+#include "cuda_wrapper.cuh"
 #include "fft.h"
 #include "ntt.cuh"
 #include "plaintext.h"
@@ -21,6 +22,10 @@ private:
     std::vector<uint32_t> rotation_group_;
     std::unique_ptr<DCKKSEncoderInfo> gpu_ckks_msg_vec_;
     uint32_t first_chain_index_ = 1;
+
+    void encode_internal(const PhantomContext &context, const phantom::util::cuda_auto_ptr<cuDoubleComplex>& values,
+                                         size_t chain_index, double scale,
+                                         PhantomPlaintext &destination, const cudaStream_t &stream);
 
     void encode_internal(const PhantomContext &context,
                          const cuDoubleComplex *values, size_t values_size,
@@ -93,6 +98,29 @@ public:
         destination.chain_index_ = 0;
         destination.resize(context.coeff_mod_size_, context.poly_degree_, s);
         encode_internal(context, values.data(), values.size(), chain_index, scale, destination, s);
+    }
+    
+    template<class T>
+    inline void encode(const PhantomContext &context,
+                       const phantom::util::cuda_auto_ptr<T> &values,
+                       double scale,
+                       PhantomPlaintext &destination,
+                       size_t chain_index = 1, // first chain index
+                       const phantom::util::cuda_stream_wrapper &stream_wrapper = *phantom::util::global_variables::default_stream) {
+        const auto &s = stream_wrapper.get_stream();
+        destination.chain_index_ = 0;
+        destination.resize(context.coeff_mod_size_, context.poly_degree_, s);
+        encode_internal(context, values, chain_index, scale, destination, s);
+    }
+
+    template<class T>
+    [[nodiscard]] inline auto encode(const PhantomContext &context, const phantom::util::cuda_auto_ptr<T> &values,
+                                     double scale,
+                                     size_t chain_index = 1, // first chain index
+                                     const phantom::util::cuda_stream_wrapper &stream_wrapper = *phantom::util::global_variables::default_stream) {
+        PhantomPlaintext destination;
+        encode(context, values, scale, destination, chain_index, stream_wrapper);
+        return destination;
     }
 
     template<class T>

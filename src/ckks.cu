@@ -86,15 +86,7 @@ PhantomCKKSEncoder::PhantomCKKSEncoder(const PhantomContext &context) {
                     cudaMemcpyHostToDevice, s);
 }
 
-void PhantomCKKSEncoder::encode_internal(const PhantomContext &context, const cuDoubleComplex *values,
-                                         size_t values_size, size_t chain_index, double scale,
-                                         PhantomPlaintext &destination, const cudaStream_t &stream) {
-    auto &context_data = context.get_context_data(chain_index);
-    auto &parms = context_data.parms();
-    auto &coeff_modulus = parms.coeff_modulus();
-    auto &rns_tool = context_data.gpu_rns_tool();
-    std::size_t coeff_modulus_size = coeff_modulus.size();
-    std::size_t coeff_count = parms.poly_modulus_degree();
+void PhantomCKKSEncoder::encode_internal(const PhantomContext &context, const cuDoubleComplex* values, size_t values_size, size_t chain_index, double scale, PhantomPlaintext &destination, const cudaStream_t &stream) {
 
     if (!values && values_size > 0) {
         throw std::invalid_argument("values cannot be null");
@@ -103,13 +95,29 @@ void PhantomCKKSEncoder::encode_internal(const PhantomContext &context, const cu
         throw std::invalid_argument("values_size is too large");
     }
 
+    auto temp = make_cuda_auto_ptr<cuDoubleComplex>(values_size, stream);
+    PHANTOM_CHECK_CUDA(
+            cudaMemcpyAsync(temp.get(), values, sizeof(cuDoubleComplex) * values_size, cudaMemcpyHostToDevice, stream));
+    encode_internal(context, temp, chain_index, scale, destination, stream);
+}
+
+void PhantomCKKSEncoder::encode_internal(const PhantomContext &context, const cuda_auto_ptr<cuDoubleComplex>& values,
+                                         size_t chain_index, double scale,
+                                         PhantomPlaintext &destination, const cudaStream_t &stream) {
+    auto &context_data = context.get_context_data(chain_index);
+    auto &parms = context_data.parms();
+    auto &coeff_modulus = parms.coeff_modulus();
+    auto &rns_tool = context_data.gpu_rns_tool();
+    std::size_t coeff_modulus_size = coeff_modulus.size();
+    std::size_t coeff_count = parms.poly_modulus_degree();
+
     // Check that scale is positive and not too large
     if (scale <= 0 || (static_cast<int>(log2(scale)) + 1 >= context_data.total_coeff_modulus_bit_count())) {
         throw std::invalid_argument("scale out of bounds");
     }
 
     if (sparse_slots_ == 0) {
-        uint32_t log_sparse_slots = ceil(log2(values_size));
+        uint32_t log_sparse_slots = ceil(log2(values.get_n()));
         sparse_slots_ = 1 << log_sparse_slots;
     } else {
         // Newly commented, not sure if we need this:
@@ -125,15 +133,11 @@ void PhantomCKKSEncoder::encode_internal(const PhantomContext &context, const cu
 
     gpu_ckks_msg_vec_->set_sparse_slots(sparse_slots_);
     PHANTOM_CHECK_CUDA(cudaMemsetAsync(gpu_ckks_msg_vec_->in(), 0, slots_ * sizeof(cuDoubleComplex), stream));
-    auto temp = make_cuda_auto_ptr<cuDoubleComplex>(values_size, stream);
-    PHANTOM_CHECK_CUDA(cudaMemsetAsync(temp.get(), 0, values_size * sizeof(cuDoubleComplex), stream));
-    PHANTOM_CHECK_CUDA(
-            cudaMemcpyAsync(temp.get(), values, sizeof(cuDoubleComplex) * values_size, cudaMemcpyHostToDevice, stream));
 
     uint32_t log_sparse_n = log2(sparse_slots_);
     uint64_t gridDimGlb = ceil(sparse_slots_ / blockDimGlb.x);
     bit_reverse_and_zero_padding<<<gridDimGlb, blockDimGlb, 0, stream>>>(
-            gpu_ckks_msg_vec_->in(), temp.get(), values_size, sparse_slots_, log_sparse_n);
+            gpu_ckks_msg_vec_->in(), values.get(), values.get_n(), sparse_slots_, log_sparse_n);
 
     double fix = scale / static_cast<double>(sparse_slots_);
 
