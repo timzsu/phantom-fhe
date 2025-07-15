@@ -1,9 +1,15 @@
+#include "ciphertext.h"
+#include "cuda_wrapper.cuh"
 #include "evaluate.cuh"
 
 #include "rns_bconv.cuh"
 #include "scalingvariant.cuh"
 #include "util.cuh"
 #include <iostream>
+#include <chrono>
+#include <queue>
+#include <set>
+#include <stdexcept>
 
 using namespace std;
 using namespace phantom;
@@ -1916,5 +1922,414 @@ void hoisting_inplace(const PhantomContext &context, PhantomCiphertext &ct, cons
     } else {
         cudaMemcpyAsync(ct.data() + size_Ql_n, acc_cx.get() + size_QlP_n, size_Ql_n * sizeof(uint64_t),
                         cudaMemcpyDeviceToDevice, s);
+    }
+}
+
+void batched_rotation_inplace(const PhantomContext &context, const PhantomCiphertext &ct, std::vector<PhantomCiphertext> &dstct, const PhantomGaloisKey &glk,
+    const std::vector<int> &steps, const phantom::util::cuda_stream_wrapper &stream_wrapper) {
+    const auto &s = stream_wrapper.get_stream();
+
+    if (ct.size() > 2)
+        throw invalid_argument("ciphertext size must be 2");
+
+    auto &context_data = context.get_context_data(ct.chain_index());
+    auto &key_context_data = context.get_context_data(0);
+    auto &key_parms = key_context_data.parms();
+    auto scheme = key_parms.scheme();
+    auto n = key_parms.poly_modulus_degree();
+    auto mul_tech = key_parms.mul_tech();
+    auto &key_modulus = key_parms.coeff_modulus();
+    size_t size_P = key_parms.special_modulus_size();
+    size_t size_QP = key_modulus.size();
+
+    // HPS and HPSOverQ does not drop modulus
+    uint32_t levelsDropped;
+
+    if (scheme == scheme_type::bfv) {
+        levelsDropped = 0;
+        if (mul_tech == mul_tech_type::hps_overq_leveled) {
+            size_t depth = ct.GetNoiseScaleDeg();
+            bool isKeySwitch = true;
+            bool is_Asymmetric = ct.is_asymmetric();
+            size_t levels = depth - 1;
+            auto dcrtBits = static_cast<double>(context.get_context_data(1).gpu_rns_tool().qMSB());
+
+            // how many levels to drop
+            levelsDropped = FindLevelsToDrop(context, levels, dcrtBits, isKeySwitch, is_Asymmetric);
+        }
+    } else if (scheme == scheme_type::bgv || scheme == scheme_type::ckks) {
+        levelsDropped = ct.chain_index() - 1;
+    } else {
+        throw invalid_argument("unsupported scheme in keyswitch_inplace");
+    }
+
+    auto &rns_tool = context.get_context_data(1 + levelsDropped).gpu_rns_tool();
+    auto &parms = context_data.parms();
+    auto &key_galois_tool = context.key_galois_tool_;
+    auto &galois_elts = key_galois_tool->galois_elts();
+
+    auto modulus_QP = context.gpu_rns_tables().modulus();
+
+    size_t size_Ql = rns_tool.base_Ql().size();
+    size_t size_Q = size_QP - size_P;
+    size_t size_QlP = size_Ql + size_P;
+
+    auto size_Q_n = size_Q * n;
+    auto size_Ql_n = size_Ql * n;
+    auto size_QP_n = size_QP * n;
+    auto size_QlP_n = size_QlP * n;
+
+    auto c0 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+    auto c1 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+
+    auto elts = key_galois_tool->get_elts_from_steps(steps);
+
+    // ------------------------------------------ automorphism c0 ------------------------------------------------------
+
+    // specific operations for HPSOverQLeveled
+    if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+        rns_tool.scaleAndRound_HPS_Q_Ql(c0.get(), ct.data(), s);
+    } else {
+        cudaMemcpyAsync(
+        c0.get(), ct.data(), size_Ql_n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, s);
+    }
+
+    // ----------------------------------------------- modup c1 --------------------------------------------------------
+
+    // specific operations for HPSOverQLeveled
+    if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+        rns_tool.scaleAndRound_HPS_Q_Ql(c1.get(), ct.data() + size_Q_n, s);
+    } else {
+        cudaMemcpyAsync(
+        c1.get(), ct.data() + size_Ql_n, size_Ql_n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, s);
+    }
+
+    size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
+
+    // mod up
+    auto modup_c1 = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
+    rns_tool.modup(modup_c1.get(), c1.get(), context.gpu_rns_tables(), scheme, s);
+
+    // ------------------------------------------ automorphism c1 ------------------------------------------------------
+
+    auto temp_modup_c1 = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
+
+    // ----------------------------------------- inner product c1 ------------------------------------------------------
+
+    auto reduction_threshold =
+    (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
+
+    // ------------------------------------------ loop accumulate ------------------------------------------------------
+
+    auto temp_c0 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+    auto temp_cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
+
+    dstct.clear();
+    dstct.resize(elts.size(), ct);
+
+    for (size_t i = 0; i < elts.size(); i++) {
+        // automorphism c0
+
+        auto elt = elts[i];
+        auto iter = find(galois_elts.begin(), galois_elts.end(), elt);
+        if (iter == galois_elts.end())
+            throw std::logic_error("Galois key not present in hoisting");
+        auto elt_index = iter - galois_elts.begin();
+
+        if (parms.scheme() == scheme_type::bfv) {
+            key_galois_tool->apply_galois(c0.get(), context.gpu_rns_tables(), size_Ql, elt_index, temp_c0.get(), s);
+        } else if (parms.scheme() == scheme_type::ckks || parms.scheme() == scheme_type::bgv) {
+            key_galois_tool->apply_galois_ntt(c0.get(), size_Ql, elt_index, temp_c0.get(), s);
+        } else {
+            throw logic_error("scheme not implemented");
+        }
+
+        // automorphism c1
+
+        for (size_t b = 0; b < beta; b++) {
+            key_galois_tool->apply_galois_ntt(modup_c1.get() + b * size_QlP_n, size_QlP, elt_index,
+                                    temp_modup_c1.get() + b * size_QlP_n, s);
+        }
+
+        // inner product c1
+        key_switch_inner_prod_c2_and_evk<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+            temp_cx.get(), temp_modup_c1.get(), glk.get_relin_keys(elt_index).public_keys_ptr(), modulus_QP, n,
+            size_QP, size_QP_n, size_QlP, size_QlP_n, size_Q, size_Ql, beta, reduction_threshold);
+
+        // -------------------------------------------- mod down c1 --------------------------------------------------------
+        rns_tool.moddown_from_NTT(temp_cx.get(), temp_cx.get(), context.gpu_rns_tables(), scheme, s);
+        rns_tool.moddown_from_NTT(temp_cx.get() + size_QlP_n, temp_cx.get() + size_QlP_n, context.gpu_rns_tables(), scheme,
+                    s);
+
+        // new c0
+        if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+            add_rns_poly<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+        temp_c0.get(), temp_cx.get(), rns_tool.base_Ql().base(),
+        temp_cx.get(), n, size_Ql);
+        rns_tool.ExpandCRTBasis_Ql_Q(dstct[i].data(), temp_cx.get(), s);
+        } else {
+            add_rns_poly<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+        temp_c0.get(), temp_cx.get(), rns_tool.base_Ql().base(),
+        dstct[i].data(), n, size_Ql);
+        }
+
+        // new c1
+        if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+            rns_tool.ExpandCRTBasis_Ql_Q(dstct[i].data() + size_Q_n, temp_cx.get() + size_QlP_n, s);
+        } else {
+            cudaMemcpyAsync(dstct[i].data() + size_Ql_n, temp_cx.get() + size_QlP_n, size_Ql_n * sizeof(uint64_t),
+                cudaMemcpyDeviceToDevice, s);
+        }
+    }
+}
+
+void batched_rotation_inplace(const PhantomContext &context, const std::vector<PhantomCiphertext> &srcct, PhantomCiphertext &dstct, const PhantomGaloisKey &glk,
+    const std::vector<int> &steps, const phantom::util::cuda_stream_wrapper &stream_wrapper) {
+    const auto &s = stream_wrapper.get_stream();
+
+    for (const auto &ct: srcct) {
+        if (ct.size() > 2)
+            throw invalid_argument("ciphertext size must be 2");
+        if (ct.chain_index() != srcct[0].chain_index()) {
+            throw invalid_argument("all ciphertexts must have the same chain index");
+        }
+    }
+    auto &context_data = context.get_context_data(srcct[0].chain_index());
+    auto &key_context_data = context.get_context_data(0);
+    auto &key_parms = key_context_data.parms();
+    auto scheme = key_parms.scheme();
+    auto n = key_parms.poly_modulus_degree();
+    auto mul_tech = key_parms.mul_tech();
+    auto &key_modulus = key_parms.coeff_modulus();
+    size_t size_P = key_parms.special_modulus_size();
+    size_t size_QP = key_modulus.size();
+
+    // HPS and HPSOverQ does not drop modulus
+    uint32_t levelsDropped;
+
+    auto &rns_tool = context.get_context_data(1 + levelsDropped).gpu_rns_tool();
+    auto &parms = context_data.parms();
+    auto &key_galois_tool = context.key_galois_tool_;
+    auto &galois_elts = key_galois_tool->galois_elts();
+
+    auto modulus_QP = context.gpu_rns_tables().modulus();
+
+    size_t size_Ql = rns_tool.base_Ql().size();
+    size_t size_Q = size_QP - size_P;
+    size_t size_QlP = size_Ql + size_P;
+
+    auto size_Q_n = size_Q * n;
+    auto size_Ql_n = size_Ql * n;
+    auto size_QP_n = size_QP * n;
+    auto size_QlP_n = size_QlP * n;
+
+    auto c0 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+    auto c1 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+
+    auto elts = key_galois_tool->get_elts_from_steps(steps);
+
+    cuda_auto_ptr<uint64_t> acc_c0, acc_cx;
+
+    size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
+
+    // mod up
+    auto modup_c1 = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
+    auto temp_modup_c1 = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
+
+    auto reduction_threshold =
+            (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
+
+    auto temp_c0 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+    auto temp_cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
+
+    for (size_t i = 0; i < elts.size(); i++) {
+        const auto& ct = srcct[i];
+
+        if (scheme == scheme_type::bfv) {
+            levelsDropped = 0;
+            if (mul_tech == mul_tech_type::hps_overq_leveled) {
+                size_t depth = ct.GetNoiseScaleDeg();
+                bool isKeySwitch = true;
+                bool is_Asymmetric = ct.is_asymmetric();
+                size_t levels = depth - 1;
+                auto dcrtBits = static_cast<double>(context.get_context_data(1).gpu_rns_tool().qMSB());
+
+                // how many levels to drop
+                levelsDropped = FindLevelsToDrop(context, levels, dcrtBits, isKeySwitch, is_Asymmetric);
+            }
+        } else if (scheme == scheme_type::bgv || scheme == scheme_type::ckks) {
+            levelsDropped = ct.chain_index() - 1;
+        } else {
+            throw invalid_argument("unsupported scheme in keyswitch_inplace");
+        }
+
+        // Load c0
+        if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+            rns_tool.scaleAndRound_HPS_Q_Ql(c0.get(), ct.data(), s);
+        } else {
+            cudaMemcpyAsync(
+                    c0.get(), ct.data(), size_Ql_n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, s);
+        }
+
+        // Load c1
+        if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+            rns_tool.scaleAndRound_HPS_Q_Ql(c1.get(), ct.data() + size_Q_n, s);
+        } else {
+            cudaMemcpyAsync(
+                    c1.get(), ct.data() + size_Ql_n, size_Ql_n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, s);
+        }
+        
+        // automorphism c0
+
+        auto elt = elts[i];
+        auto iter = find(galois_elts.begin(), galois_elts.end(), elt);
+        if (iter == galois_elts.end())
+            throw std::logic_error("Galois key not present in hoisting");
+        auto elt_index = iter - galois_elts.begin();
+
+        if (parms.scheme() == scheme_type::bfv) {
+            key_galois_tool->apply_galois(c0.get(), context.gpu_rns_tables(), size_Ql, elt_index, temp_c0.get(), s);
+        } else if (parms.scheme() == scheme_type::ckks || parms.scheme() == scheme_type::bgv) {
+            key_galois_tool->apply_galois_ntt(c0.get(), size_Ql, elt_index, temp_c0.get(), s);
+        } else {
+            throw logic_error("scheme not implemented");
+        }
+
+        // mod up c1
+        rns_tool.modup(modup_c1.get(), c1.get(), context.gpu_rns_tables(), scheme, s);
+
+        // automorphism c1
+
+        for (size_t b = 0; b < beta; b++) {
+            key_galois_tool->apply_galois_ntt(modup_c1.get() + b * size_QlP_n, size_QlP, elt_index,
+                                              temp_modup_c1.get() + b * size_QlP_n, s);
+        }
+
+        // inner product c1
+        key_switch_inner_prod_c2_and_evk<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                temp_cx.get(), temp_modup_c1.get(), glk.get_relin_keys(elt_index).public_keys_ptr(), modulus_QP, n,
+                size_QP, size_QP_n, size_QlP, size_QlP_n, size_Q, size_Ql, beta, reduction_threshold);
+
+        // add to acc_c0 and acc_cx
+        if (i == 0) {
+            acc_c0 = temp_c0;
+            acc_cx = temp_cx;
+        } else {
+            add_rns_poly<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                acc_c0.get(), temp_c0.get(), rns_tool.base_Ql().base(), acc_c0.get(), n, size_Ql);
+            add_rns_poly<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                    acc_cx.get(), temp_cx.get(), rns_tool.base_QlP().base(), acc_cx.get(),
+                    n, size_QlP);
+            add_rns_poly<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                    acc_cx.get() + size_QlP_n, temp_cx.get() + size_QlP_n,
+                    rns_tool.base_QlP().base(), acc_cx.get() + size_QlP_n, n, size_QlP);
+        }
+    }
+
+    // -------------------------------------------- mod down c1 --------------------------------------------------------
+    rns_tool.moddown_from_NTT(acc_cx.get(), acc_cx.get(), context.gpu_rns_tables(), scheme, s);
+    rns_tool.moddown_from_NTT(acc_cx.get() + size_QlP_n, acc_cx.get() + size_QlP_n, context.gpu_rns_tables(), scheme,
+                              s);
+
+    dstct = srcct[0];
+
+    // new c0
+    if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+        add_rns_poly<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                acc_c0.get(), acc_cx.get(), rns_tool.base_Ql().base(),
+                acc_cx.get(), n, size_Ql);
+        rns_tool.ExpandCRTBasis_Ql_Q(dstct.data(), acc_cx.get(), s);
+    } else {
+        add_rns_poly<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                acc_c0.get(), acc_cx.get(), rns_tool.base_Ql().base(),
+                dstct.data(), n, size_Ql);
+    }
+
+    // new c1
+    if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+        rns_tool.ExpandCRTBasis_Ql_Q(dstct.data() + size_Q_n, acc_cx.get() + size_QlP_n, s);
+    } else {
+        cudaMemcpyAsync(dstct.data() + size_Ql_n, acc_cx.get() + size_QlP_n, size_Ql_n * sizeof(uint64_t),
+                        cudaMemcpyDeviceToDevice, s);
+    }
+}
+
+void batched_rotation_standard(const PhantomContext &context, const PhantomCiphertext &ct, std::vector<PhantomCiphertext> &dstct, const PhantomGaloisKey &glk,
+    const std::vector<int> &steps, const phantom::util::cuda_stream_wrapper &stream_wrapper) {
+    auto &context_data = context.get_context_data(ct.chain_index());
+
+    size_t coeff_count = context_data.parms().poly_modulus_degree();
+
+    // Tree
+    std::map<int, std::vector<int>> children;
+    std::map<int, PhantomCiphertext> rotated_ct;
+    std::queue<int> node_buffer;
+
+    children[0] = {}; rotated_ct[0] = ct;
+
+    // build the tree
+    for (int step : steps) {
+        if (step == 0) {
+            continue;
+        }
+        vector<int> naf_step = naf(step);
+        if (static_cast<size_t>(abs(naf_step[naf_step.size() - 1])) == (coeff_count >> 1)) {
+            naf_step.pop_back();
+        }
+        int tmp = step, cursor=0;
+        for (; cursor<naf_step.size(); cursor++) {
+            if (children.count(tmp)) {
+                break;
+            }
+            tmp -= naf_step[cursor];
+        }
+        if (!children.count(tmp)) {
+            throw std::runtime_error("tmp not found is unexpected!");
+        }
+        cursor--;
+        for (; cursor>=0; cursor--) {
+            if (children.count(tmp+naf_step[cursor])) {
+                throw std::runtime_error("tmp found is unexpected!");
+            }
+            int next = tmp+naf_step[cursor];
+            children[next] = {};
+            children[tmp].push_back(next);
+            tmp = next;
+        }
+    }
+
+    // traverse the tree
+    node_buffer.push(0);
+    while (!node_buffer.empty()) {
+        int node = node_buffer.front(); node_buffer.pop();
+        std::vector<int> offsets;
+        for (int& ch : children[node]) {
+            if (rotated_ct.count(ch)) {
+                throw std::runtime_error("already rotated ciphertext revisited");
+            }
+            offsets.push_back(ch-node);
+            node_buffer.push(ch);
+        }
+
+        // rotations
+        if (children[node].size() <= 3) {
+            for (int i=0; i<children[node].size(); i++) {
+                rotated_ct[children[node][i]] = rotate_vector(context, rotated_ct[node], offsets[i], glk, stream_wrapper);
+            }
+        } else {
+            std::vector<PhantomCiphertext> dst;
+            batched_rotation_inplace(context, rotated_ct[node], dst, glk, offsets, stream_wrapper);
+            for (int i=0; i<children[node].size(); i++) {
+                rotated_ct[children[node][i]] = dst[i];
+            }
+        }
+    }
+
+    dstct.clear();
+    for (int step : steps) {
+        if (!rotated_ct.count(step)) {
+            throw std::runtime_error("rotated ciphertext not computed");
+        }
+        dstct.push_back(rotated_ct[step]);
     }
 }

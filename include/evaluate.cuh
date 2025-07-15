@@ -302,3 +302,18 @@ inline auto hoisting(const PhantomContext &context, const PhantomCiphertext &enc
     hoisting_inplace(context, destination, glk, steps, stream_wrapper);
     return destination;
 }
+
+void batched_rotation_standard(const PhantomContext &context, const PhantomCiphertext &ct, std::vector<PhantomCiphertext> &dstct, 
+    const PhantomGaloisKey &glk,
+    const std::vector<int> &steps,
+    const phantom::util::cuda_stream_wrapper &stream_wrapper = *phantom::util::global_variables::default_stream);
+
+void batched_rotation_inplace(const PhantomContext &context, const PhantomCiphertext &ct, std::vector<PhantomCiphertext> &dstct, 
+    const PhantomGaloisKey &glk,
+    const std::vector<int> &steps,
+    const phantom::util::cuda_stream_wrapper &stream_wrapper = *phantom::util::global_variables::default_stream);
+
+void batched_rotation_inplace(const PhantomContext &context, const std::vector<PhantomCiphertext> &ct, PhantomCiphertext &dstct, 
+    const PhantomGaloisKey &glk,
+    const std::vector<int> &steps,
+    const phantom::util::cuda_stream_wrapper &stream_wrapper = *phantom::util::global_variables::default_stream);
