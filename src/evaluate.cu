@@ -2093,6 +2093,9 @@ void batched_rotation_inplace(const PhantomContext &context, const std::vector<P
         if (ct.chain_index() != srcct[0].chain_index()) {
             throw invalid_argument("all ciphertexts must have the same chain index");
         }
+        if (ct.GetNoiseScaleDeg() != srcct[0].GetNoiseScaleDeg()) {
+            throw invalid_argument("all ciphertexts must have the same noise scale degree");
+        }
     }
     auto &context_data = context.get_context_data(srcct[0].chain_index());
     auto &key_context_data = context.get_context_data(0);
@@ -2106,6 +2109,24 @@ void batched_rotation_inplace(const PhantomContext &context, const std::vector<P
 
     // HPS and HPSOverQ does not drop modulus
     uint32_t levelsDropped;
+
+    if (scheme == scheme_type::bfv) {
+        levelsDropped = 0;
+        if (mul_tech == mul_tech_type::hps_overq_leveled) {
+            size_t depth = srcct[0].GetNoiseScaleDeg();
+            bool isKeySwitch = true;
+            bool is_Asymmetric = srcct[0].is_asymmetric();
+            size_t levels = depth - 1;
+            auto dcrtBits = static_cast<double>(context.get_context_data(1).gpu_rns_tool().qMSB());
+
+            // how many levels to drop
+            levelsDropped = FindLevelsToDrop(context, levels, dcrtBits, isKeySwitch, is_Asymmetric);
+        }
+    } else if (scheme == scheme_type::bgv || scheme == scheme_type::ckks) {
+        levelsDropped = srcct[0].chain_index() - 1;
+    } else {
+        throw invalid_argument("unsupported scheme in keyswitch_inplace");
+    }
 
     auto &rns_tool = context.get_context_data(1 + levelsDropped).gpu_rns_tool();
     auto &parms = context_data.parms();
@@ -2123,45 +2144,27 @@ void batched_rotation_inplace(const PhantomContext &context, const std::vector<P
     auto size_QP_n = size_QP * n;
     auto size_QlP_n = size_QlP * n;
 
-    auto c0 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
-    auto c1 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
-
     auto elts = key_galois_tool->get_elts_from_steps(steps);
 
     cuda_auto_ptr<uint64_t> acc_c0, acc_cx;
 
     size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
 
+    auto reduction_threshold =
+            (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
+
+    auto c0 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+    auto c1 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+
     // mod up
     auto modup_c1 = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
     auto temp_modup_c1 = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
-
-    auto reduction_threshold =
-            (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
 
     auto temp_c0 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
     auto temp_cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
 
     for (size_t i = 0; i < elts.size(); i++) {
         const auto& ct = srcct[i];
-
-        if (scheme == scheme_type::bfv) {
-            levelsDropped = 0;
-            if (mul_tech == mul_tech_type::hps_overq_leveled) {
-                size_t depth = ct.GetNoiseScaleDeg();
-                bool isKeySwitch = true;
-                bool is_Asymmetric = ct.is_asymmetric();
-                size_t levels = depth - 1;
-                auto dcrtBits = static_cast<double>(context.get_context_data(1).gpu_rns_tool().qMSB());
-
-                // how many levels to drop
-                levelsDropped = FindLevelsToDrop(context, levels, dcrtBits, isKeySwitch, is_Asymmetric);
-            }
-        } else if (scheme == scheme_type::bgv || scheme == scheme_type::ckks) {
-            levelsDropped = ct.chain_index() - 1;
-        } else {
-            throw invalid_argument("unsupported scheme in keyswitch_inplace");
-        }
 
         // Load c0
         if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
